@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import site
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,13 +30,18 @@ def _default_rules_path() -> Path:
 
     Source checkout: <repo>/rules/rules.json. Installed wheel: the data file lands
     in <prefix>/share/skillsentinel/rules/rules.json (see [tool.setuptools.data-files])
-    while site-packages/skillsentinel/ has no sibling rules/ directory.
+    while site-packages/skillsentinel/ has no sibling rules/ directory. A
+    `pip install --user` wheel lands the data file under the *user base*
+    (<userbase>/share/...), not under sys.prefix, so that layout is probed too.
     """
     pkg_dir = Path(__file__).resolve().parent
     candidates = [
         pkg_dir.parent / "rules" / "rules.json",                     # source tree
         Path(sys.prefix) / "share" / "skillsentinel" / "rules" / "rules.json",  # installed
     ]
+    if site.USER_BASE:  # None in some embedded interpreters
+        candidates.append(Path(site.USER_BASE) / "share" / "skillsentinel"
+                          / "rules" / "rules.json")              # pip install --user
     for c in candidates:
         if c.is_file():
             return c
@@ -64,6 +70,13 @@ class Rule:
     requires_pattern: Pattern[str] | None = None
     escalate_pattern: Pattern[str] | None = None
     syntax: str = "regex"
+    # `doc_surface`: this rule's instruction surface includes documentation.
+    # A README.md is read by an agent exactly like a SKILL.md is; scoping an
+    # injection rule to directive files alone leaves the most-read file in the
+    # repository outside the detection surface. Only meaningful for
+    # kind=intent + context=directive (enforced in _compile): the payload is an
+    # instruction, not a dual-use primitive, so prose in a doc *is* the attack.
+    doc_surface: bool = False
 
     @property
     def severity_rank(self) -> int:
@@ -73,10 +86,18 @@ class Rule:
 def _re(raw: Any, default_flags: int = re.IGNORECASE) -> Pattern[str] | None:
     if not raw:
         return None
-    return re.compile(raw, default_flags)
+    try:
+        return re.compile(raw, default_flags)
+    except (re.error, TypeError) as e:
+        # re.PatternError is not a ValueError: without this wrap a bad regex
+        # in the catalog escapes as an "internal error" instead of a bad input.
+        raise ValueError(f"invalid regex {raw!r}: {e}") from None
 
 
 def _compile(raw: dict[str, Any]) -> Rule:
+    for key in ("id", "title", "category", "severity"):
+        if key not in raw:
+            raise ValueError(f"rule entry is missing required key {key!r}")
     flags = 0
     if raw.get("ignore_case", True):
         flags |= re.IGNORECASE
@@ -88,6 +109,15 @@ def _compile(raw: dict[str, Any]) -> Rule:
         raise ValueError(f"rule {raw['id']}: bad kind {kind!r}")
     if context not in CONTEXTS:
         raise ValueError(f"rule {raw['id']}: bad context {context!r}")
+    doc_surface = bool(raw.get("doc_surface", False))
+    if doc_surface and (kind != "intent" or context != "directive"):
+        # A dual-use primitive (a piped installer, an authorized_keys write) in
+        # prose is mention-not-use wherever it sits; widening its surface to docs
+        # would make every install instruction a finding. Reject the flag instead
+        # of silently ignoring it, so a copy-paste cannot widen a capability rule.
+        raise ValueError(
+            f"rule {raw['id']}: doc_surface requires kind=intent and "
+            f"context=directive (got kind={kind!r}, context={context!r})")
     return Rule(
         id=raw["id"],
         title=raw["title"],
@@ -99,15 +129,33 @@ def _compile(raw: dict[str, Any]) -> Rule:
         kind=kind,
         context=context,
         not_pattern=_re(raw.get("not_pattern")),
-        requires_pattern=_re(raw.get("requires_pattern")),
+        # requires_pattern does file-level correlation, so it must honor the
+        # rule's own flags (a multiline ^...$ blob-assignment shape would
+        # otherwise never match past line one).
+        requires_pattern=_re(raw.get("requires_pattern"), flags),
         escalate_pattern=_re(raw.get("escalate_pattern")),
+        doc_surface=doc_surface,
     )
 
 
 def load_rules(path: Path | str | None = None) -> list[Rule]:
     p = Path(path) if path else RULES_PATH
     data = json.loads(p.read_text(encoding="utf-8"))
-    rules = [_compile(r) for r in data["rules"]]
+    # A valid-JSON document of the wrong shape is a bad input file, not a bug:
+    # every shape/regex problem here is ValueError, which both call sites wrap
+    # into an input error naming the path (exit 2) — never KeyError/TypeError
+    # leaking as "internal error" exit 3. An explicit empty 'rules' array is
+    # NOT a shape error: it loads as zero rules and the caller (scan_path)
+    # refuses a zero-rule catalog as an input error.
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        raise ValueError("not a rules catalog: expected an object "
+                         "with a 'rules' array")
+    rules = []
+    for i, raw in enumerate(data["rules"]):
+        if not isinstance(raw, dict):
+            raise ValueError(f"rule #{i}: expected an object, "
+                             f"got {type(raw).__name__}")
+        rules.append(_compile(raw))
     ids = [r.id for r in rules]
     if len(ids) != len(set(ids)):
         dupes = {i for i in ids if ids.count(i) > 1}

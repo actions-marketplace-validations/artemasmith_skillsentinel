@@ -1,6 +1,6 @@
 # Detection rules
 
-Generated from [`rules/rules.json`](../rules/rules.json) — 46 rules as of catalog v0.3.4 (`python3 -m skillsentinel rules` prints the live count). Do not hand-edit; regenerate instead.
+Generated from [`rules/rules.json`](../rules/rules.json) — 46 rules as of catalog v0.3.5 (`python3 -m skillsentinel rules` prints the live count). Do not hand-edit; regenerate instead.
 
 Every rule match is a **candidate**, not a finding. A file-local verifier (`skillsentinel/verifier.py`) then confirms or demotes it — every demotion carries a written reason in the output. Severity below is the *candidate* severity from the catalog; confirmed findings keep it, demoted ones are reported as `low_trust`.
 

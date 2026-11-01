@@ -51,7 +51,7 @@ is unbounded.
   documentation contexts; the card's "zero injection-class demotions" property
   is asserted by test.
 - Malicious / i18n / archive fixtures: unchanged from 0.3.4 (43 / 8 / 2
-  exploitable, exit 1); bypass corpus 45/45 caught; `unittest discover` 308
+  exploitable, exit 1); bypass corpus 45/45 caught; `unittest discover` 344
   tests OK.
 
 ## [0.3.4] - 2026-10-21

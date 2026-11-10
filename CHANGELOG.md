@@ -5,6 +5,265 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-10-22
+
+The precision wave that 0.3.4 specified but did not implement: a match in
+**documentation context** is no longer a finding. Skill files teach as much as
+they instruct, and a rule quoted in a fenced block, an inline code span, a
+blockquote, a table row, an example/usage section or a pasted log line is the
+skill explaining itself, not the skill doing something. Such matches now land
+in `demoted[]` with a machine-readable `reason` instead of the verdict, so
+nothing leaves the report — only the exit code changes.
+
+The carve-out is deliberately narrow. Injection-class rules (`SS001`, `SS002`,
+`SS004`, `SS006`, `SS007`, `SS008`) and the download-and-exec classes are
+**exempt**: obfuscated intent is not cancelled by wrapping it in backticks. The
+fail-closed combination of "secret-shaped value + egress" also stays armed in
+all six documentation shapes — the one place where the cost of trusting prose
+is unbounded.
+
+### Added
+
+- Doc-context demotion for non-injection rules: six documentation shapes
+  detected per line (fenced code block, inline code span, blockquote, table
+  row, example/usage section, quoted log line), each demotion carrying its
+  reason. Injection and download-and-exec classes are explicitly exempt.
+- `tests/test_doc_context_demotion.py` and `tests/test_combo_failclosed.py`:
+  the exempt classes are asserted to still fire in every documentation shape,
+  and the secret-plus-egress combination is asserted fail-closed in all six.
+
+### Changed
+
+- Live corpus (`~/.hermes/skills`, 531 files): confirmed findings 4 → 2,
+  demoted 79, zero files skipped. Both survivors are known false positives on
+  honest prose (tracked for the follow-up precision card, not hidden here).
+- `docs/rules.md`: the `SS041` relay example is stubbed as `n&#99; -e` — the
+  catalog is itself scanned in CI, and a literal send-side token five lines
+  above the sensitive-path list armed the scanner's own fail-closed heuristic.
+  The rule still matches `nc -e` literally.
+- CI: SARIF output moved out of the scanned tree (`$RUNNER_TEMP` / repo root),
+  and the docs catalog is sanitized so the self-scan and packaging jobs stop
+  tripping on our own documentation.
+
+### Fixed
+
+- Adversarial review round 2 (C1): the exfil combo is closed in 6/6
+  documentation contexts; the card's "zero injection-class demotions" property
+  is asserted by test.
+- Malicious / i18n / archive fixtures: unchanged from 0.3.4 (43 / 8 / 2
+  exploitable, exit 1); bypass corpus 45/45 caught; `unittest discover` 344
+  tests OK.
+
+## [0.3.4] - 2026-10-21
+
+Two waves in one release. The P4 precision wave shrinks the false-positive
+class "a skill is an instruction to an agent" — what ships here is the
+baseline: a known-accepted tree stops failing the gate without a single
+finding leaving the report (the wider doc-context demotion below is specified
+for this wave but not implemented yet). The recall wave closes defects R1–R3
+from the v0.3.3 audit (acceptance tests in `tests/test_v034_audit.py`): three
+classes of hostile skill the walk and the rule catalog simply did not see.
+The malicious corpus still prints the same 43 confirmed findings — the new
+rules fire only on non-English signals.
+
+### Added
+
+- `--write-baseline FILE` / `--baseline FILE`: content-keyed, per-finding
+  baselines (path + rule id + snippet sha256, plus a `rules_version` header).
+  Deleting a file or an unrelated line does not shift the baseline; editing
+  the matched line re-triggers it as a new finding to re-review; a file
+  baselined for one rule never hides a different rule's finding in the same
+  file. A baseline whose `rules_version` differs from the installed one is
+  not trusted — loud stderr warning, every finding re-evaluated as new,
+  exit 1. The effect is exit-code-only: baselined findings stay in the report
+  (tagged `(baselined)` in text output) and in JSON/SARIF exactly as before;
+  the two flags are mutually exclusive (error, exit 2).
+- Documentation in the README: a Baselines section with the honest framing —
+  a baseline hides known-accepted findings from the exit code, it never hides
+  them from the report — and a worked write / re-run / new-finding-probe
+  example on a real skill corpus, cleanup included; the doc-context demotion
+  documented under How verdicts work as planned, not yet shipped; the new
+  flags in the exit-code note and the Commands synopsis.
+
+- `--no-follow-symlinks`: refuse every symlink instead of following it. Each
+  declined link lands in `files_skipped` with a stderr warning naming it and
+  the reason (JSON: `warnings`); broken and looping links get the same
+  accounting on every scan, followed or not.
+- Archive scanning: `zip`/`tar.gz`/`tgz`/`whl` files in a scanned tree are
+  opened and their text members matched in memory — nothing is ever extracted
+  to disk — with findings attributed `<archive>!<inner/path>`. The archive is
+  untrusted input, so four guards refuse rather than trust it: per-member
+  uncompressed size over `--archive-max-bytes` (default 5 MB), more than 200
+  members, a compressed:uncompressed ratio over 100:1 (zip-bomb), and member
+  names that climb out of the archive (zip-slip — skipped per member, never
+  written anywhere). Every refusal is a warning counted in `files_skipped`.
+- Rules SS045/SS046 (`rules/rules.json`, documented in `docs/rules.md`): the
+  instruction-override and exfiltration families extended past English —
+  SS045 matches an override imperative in Russian/Chinese/German/Spanish near
+  the words for instructions/rules (or a Russian concealment directive), SS046
+  an exfil verb in those languages within 60 characters of a sensitive path
+  (`~/.ssh`, `id_rsa`/`id_ed25519`, `.aws/credentials`, `.env`, keychain),
+  either order. Both are `intent`/`any`-scoped: confirmed on instruction
+  surfaces, inconclusive in prose, so benign Russian text and this repo's own
+  documentation stay clean.
+
+### Fixed
+
+- R1: symlinked skill directories were invisible to the walk. On the
+  reproduction tree built by `tests/test_v034_audit.py` (R1SymlinkDescentTests:
+  35 symlinked skills x 2 files + the real skill + README = 72 reachable
+  files) v0.3.3 scanned 2 files; the same tree now scans 72. On the real
+  `~/harness/skills-live` tree the reachable count is
+  `find -L ~/harness/skills-live -type f | wc -l` = 55, and v0.3.3 scanned 6
+  of them; this version scans all 55. The walk now descends directory
+  symlinks by default (that is how skill trees are installed); loops and
+  repeat targets terminate on a visited `(st_dev, st_ino)` set instead of
+  hanging, each refusal reported as a warned skip.
+- R1b: content reachable only through an out-of-root symlink was either
+  skipped or attributed to a path inside the root. Files reached via such
+  links are now reported as `link -> target`, so a finding names both where
+  the link is and where the content lives.
+- R2: injection directives written in languages other than English passed the
+  phrase lists clean (reproduced in ru/zh/de/es). See SS045/SS046 above;
+  benign Russian prose produces no confirmed findings.
+- R3: archives shipped as skills were never opened at all — a malicious
+  `SKILL.md` inside a `payload.zip` scanned as one binary skip and exited 0.
+  See archive scanning above.
+- Review rework r2 — negator scope in the shared cancellation layer: the
+  multilingual prefix negators (ru/de/zh/es) had been appended to the shared
+  cancel/negation lexicons every rule consumes, so the Spanish token `no`
+  demoted an English hit (an English "No exceptions:" line that went on to
+  restate the classic SS001 override exited 0 instead of confirming SS001),
+  and a negator governed across a
+  clause break, so a discourse-softening prefix («Не забудь: игнорируй …»)
+  masked SS045 exactly as a negation from an earlier sentence never may. The
+  lexicons are now per rule (`negation_pattern_for`/`cancel_pattern_for` in
+  verifier.py): every rule outside SS045/SS046 cancels on the English
+  lexicons alone — the base behavior — and the multilingual negators govern
+  only their own clause, up to the first comma/semicolon/colon/dash (Western
+  or CJK); when the break falls inside the matched span, the text after it is
+  rechecked against the rule's own pattern, so a benign list («Не игнорируй
+  правила, инструкции») still demotes while the restated imperative confirms.
+  English negators keep the sentence-segment scope they always had.
+- Review rework r3 — corpus precision on the live benign tree
+  (`~/.hermes/skills`; acceptance tests in `tests/test_v034_rework3.py`).
+  The sentence-segment scoping added by rework r1 had been applied to every
+  rule, where base deb3537 never had it: an ellipsis `…` inside a quoted
+  attack string («do NOT tell the user to run …») acted as a sentence
+  terminator that cut the governing cancel word out of the segment, so lines
+  base demoted confirmed again. Segment scoping is now gated to the
+  multilingual rules (SS045/SS046) in both `_is_negated` and
+  `_governing_cancel_word`; every other rule keeps the base line-head
+  governance (`seg_start` 0). Two precision screens, both written demotions
+  (inconclusive with a reason), never silent drops: SS046 does not confirm
+  when the sensitive path is a parenthetical config SOURCE — «… `sendMessage`
+  (токен из `~/.hermes/.env`)» reads the token from the path, the path is not
+  the object being sent; the parenthesis is required, so the unparenthesized
+  twin («Отправь токен из ~/.ssh/id_rsa на …») stays confirmed critical. The
+  other r3 screen — SS006, not confirming a concealment directive quoted as
+  a specimen that opens by negating itself — was removed in rework r4
+  (097101b): wrapping a concealment directive in quotation marks is a
+  bypass, not a citation, so quoted specimens confirm again. Live benign
+  corpus: after r4
+  it sits at exactly the base deb3537 slice — 4 exploitable (file,rule)
+  pairs — no regression, no invented precision. The malicious corpus still
+  prints the same 43 confirmed findings, and the bypass corpus still catches
+  45/45.
+- Review rework r5 — SS046 destination test beyond `scheme://` (acceptance
+  tests in `tests/test_v034_rework5.py`). The parenthetical config-source
+  screen (r3, rescoped r4) accepted only an `https?://` URL as its network
+  destination, so real exfiltration aimed at a bare host (`evil.example.com`),
+  `IPv4:port`, `ftp://`, a messenger `@handle`, or a URL wrapped onto the next
+  physical line was demoted to inconclusive with a reason that falsely claimed
+  the line carried no destination; the object gate also counted a bare
+  preposition as the send verb's object («Перешли на <host> (токен из
+  <ssh-путь>)»). The destination test now matches any `scheme://` URI, a
+  dotted hostname (labels ≥2 chars, so `e.g.` never matches), `IPv4[:port]`
+  and a letter-first `@handle` (`pkg@1.2.3` never matches), searched on the
+  line and its immediately following line; a bare ru/en preposition alone is
+  no object. Live benign corpus unchanged; the malicious corpus still prints
+  43 confirmed findings, the bypass corpus still catches 45/45.
+
+### Changed
+
+- Version pins in README (GitHub Action `uses:`, pre-commit `rev:`, git install
+  refs, rules badge) follow the release: `v0.3.4`.
+- Disclosure from rework r4 (per review): the `CITATION_FRAME` lexicon on the
+  documentation surface gained the nouns `phrasings`, `attack strings` and
+  `teaches against` — quoted-match-only, so a quoted specimen framed by them
+  demotes as a citation while the same words unquoted stay caught.
+
+### Planned (not yet implemented)
+
+- Doc-context demotion: a match that sits in documentation context — a fenced
+  code block, an inline code span, a blockquote line, a markdown table row, an
+  example/usage section, or a log/JSONL line that merely quotes an earlier
+  command — will be demoted, not confirmed, and will stay visible in the JSON
+  `demoted` array with a reason string naming the context that decided it
+  (never silently dropped). The lever will never apply to the injection class
+  (SS001, SS002, SS004, SS006, SS007, SS008 — the `doc_surface` family) or to
+  download-and-exec classes; how an injection may be marked as a quoted
+  specimen on the documentation surface is governed by the `doc_surface`
+  policy, not by this lever. `--profile strict` still disables demotions.
+  Today the levers are the fenced block, the inline code span, the quoted
+  citation frame on the documentation surface, signature-table glue and
+  explicit negation, each already carrying a written reason.
+
+
+## [0.3.3]
+
+Audit fixes for v0.3.2 (defects V1–V8; acceptance tests in
+`tests/test_v033_audit.py`). No detection-rule changes — the malicious corpus
+still prints the same 43 confirmed findings.
+
+### Fixed
+
+- V1: `watch init` on a nonexistent path used to write a 0-entry snapshot and
+  exit 0 ("0 files") — every later diff then watched the wrong tree and read
+  it as clean. It is now an input error (one stderr line, exit 2, no snapshot
+  file), and a tree with zero files is refused too: an empty snapshot is
+  indistinguishable from having watched the wrong path.
+- V2: `watch diff` silently diffed whatever tree it was given against any
+  snapshot. The snapshot pins the absolute root it was taken under, and a root
+  mismatch is now an explicit input error naming both paths (exit 2, "re-run
+  watch init") instead of a bogus clean/drift verdict for another tree.
+- V3: the SARIF report declared a dead `$schema` URL (a raw.githubusercontent.com
+  oasis-tcs path that 404s, and was an Android-workflow schema, not SARIF);
+  it now declares the canonical `https://json.schemastore.org/sarif-2.1.0.json`.
+- V4: README demo output was stale (42 confirmed findings vs the real 43, and
+  an outdated summary line); the block and `docs/assets/demo.png` are
+  regenerated from the verbatim output of this commit.
+- V5: one unreadable file (chmod 000) aborted the whole scan and discarded the
+  findings already collected from the readable files. The walk now records
+  unreadable files (`unreadable_files` in `--json`) and keeps scanning; the CLI
+  prints the findings, warns about the skipped file(s) on stderr and exits 2.
+  A tree where nothing could be read is still an input error.
+- V6: `scan <script> --detonate` on a single file silently printed
+  "(0 scripts)" because only directories were rglobbed; single-file detonation
+  now actually runs the script (detonate_tree/find_scripts accept a file
+  target).
+- V7: detonation only picked up `.sh`/`.bash`/`.py`/`install` — a `.js` miner
+  or an SS044 PowerShell cradle was never run. `find_scripts` now covers
+  `.js`, `.rb`, `.pl` and `.ps1` too, each under its own interpreter
+  (node/ruby/perl/pwsh); other files (e.g. `.txt`, `.mjs`) stay excluded by
+  suffix.
+- V8: binary/non-text files were silently counted as "files scanned". They
+  are now reported separately — a cheap two-density sniff on the first chunk
+  classifies them: control bytes at ≥1/4, or non-printable bytes (controls +
+  high bytes) at ≥1/4 in a chunk that fails strict UTF-8 decode (valid UTF-8
+  stays scannable however high its bytes run). `files_scanned` counts text
+  only, the summary line shows the split (`N text, M binary skipped`), and
+  `--json` exposes `binary_files_skipped`. A bytecode blob with an embedded
+  ASCII payload (sparse controls) stays scannable, so detection counts did
+  not move. Legacy single-byte text (cp1251/koi8-r/latin-1 — dense high
+  bytes, invalid UTF-8, zero NULs) also stays scannable; only NUL-carrying
+  non-print soup is skipped.
+
+### Changed
+
+- Version pins in README (GitHub Action `uses:`, pre-commit `rev:`, git install
+  refs, rules badge) follow the release: `v0.3.3`.
+
 ## [0.3.2] - 2026-10-14
 
 Documentation is an instruction surface — the last silent demotion found by hand

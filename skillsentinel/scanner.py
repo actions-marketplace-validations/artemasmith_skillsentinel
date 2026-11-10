@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fnmatch
 import gzip
 import hashlib
@@ -11,19 +12,27 @@ import json
 import os
 import re
 import stat
+import tarfile
 import time
 import unicodedata
+import zlib
+import zipfile
 from dataclasses import dataclass, field, asdict
-from pathlib import Path
+from itertools import islice
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from . import __version__
-from .rules import RULES_PATH, Rule, load_rules, SEVERITY_ORDER
-from .verifier import (VERDICT_ORDER, VERIFIERS_BY_NAME, bind_rules,
-                       verify_findings)
+from .rules import (DOC_FRAME, DOC_SECTION_HEADING, NEVER_DEMOTE_CATEGORIES,
+                    has_exfil_combo,
+                    RULES_PATH, Rule, SHELL_PIPE, load_rules, SEVERITY_ORDER)
+from .verifier import (VERDICT_ORDER, VERIFIERS_BY_NAME, _ctx_of,
+                       _directive_roots, _fenced_state, _in_code_span,
+                       bind_rules, verify_findings)
 
 MAX_FILE_BYTES = 2_000_000  # larger files are scanned as head+tail windows
 SCAN_WINDOW_BYTES = 512 * 1024  # window size on each side of an oversize file
+BINARY_PROBE_BYTES = 4096  # the binary sniff reads only this much of a file
 
 # Directory subtrees the walker never enters. `.git` is special-cased below:
 # all of it is repo metadata except `.git/hooks/` — hook scripts are executable
@@ -45,6 +54,16 @@ MANIFEST_NAMES = {"skill.md", "skill.yaml", "skill.json", "plugin.json"}
 # see `_verification_alias`.
 EXECUTABLE_BLOB_SUFFIXES = {".pyc", ".bin"}
 VERIFICATION_ALIAS_SUFFIX = ".skillsentinel-exec.sh"
+
+# R3 (v0.3.4): archives shipped as skills are opened and their text members
+# scanned in memory — nothing is ever extracted to disk, so zip-slip has
+# nowhere to write and a bomb is bounded by the read itself. Three guards
+# refuse the archive (with a warning) instead of trusting it.
+ARCHIVE_SUFFIXES_ZIP = (".zip", ".whl")
+ARCHIVE_SUFFIXES_TAR = (".tar.gz", ".tgz")
+DEFAULT_ARCHIVE_MAX_BYTES = 5_000_000  # uncompressed member budget (--archive-max-bytes)
+ARCHIVE_MAX_ENTRIES = 200              # member-count cap
+ARCHIVE_BOMB_RATIO = 100               # compressed:uncompressed ratio cap
 
 # Inline suppression markers. They are honored ONLY with `--honor-ignores`: a scanner
 # whose findings a scanned artifact can silence is itself the vulnerability (an
@@ -93,6 +112,15 @@ class InputError(Exception):
     """
 
 
+class UnreadableFileError(InputError):
+    """One file could not be read (mode 000, vanished mid-scan).
+
+    Unlike a plain InputError the walk does not abort: `scan_path` records the
+    path on the result and keeps scanning, so the readable files' findings
+    survive; the CLI warns about the recorded files and still exits 2.
+    """
+
+
 @dataclass
 class Finding:
     rule_id: str
@@ -131,6 +159,12 @@ class ScanResult:
     truncated_files: list[str] = field(default_factory=list)
     limit_reached: tuple[int, int] | None = None
     undecodable_files: list[str] = field(default_factory=list)
+    unreadable_files: list[str] = field(default_factory=list)
+    binary_files_skipped: int = 0
+    # R1d/R3b: every refused entry (unfollowed/broken/looping symlink, guarded
+    # archive) lands here with its reason — a skip the output does not explain
+    # is indistinguishable from a clean scan.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -166,6 +200,9 @@ class ScanResult:
             "truncated_files": self.truncated_files,
             "limit_reached": list(self.limit_reached) if self.limit_reached else None,
             "undecodable_files": self.undecodable_files,
+            "unreadable_files": self.unreadable_files,
+            "binary_files_skipped": self.binary_files_skipped,
+            "warnings": self.warnings,
         }
 
 
@@ -296,21 +333,146 @@ def _git_visible(parts: tuple[str, ...]) -> bool:
     return len(parts) > i + 1 and parts[i + 1] == HOOKS_DIR
 
 
-def _iter_target_files(root: Path) -> Iterable[Path]:
+@dataclass
+class _WalkEntry:
+    """One entry the walk produced: a file to scan, or a refused entry.
+
+    `path` is None for entries the link policy declines (broken link, loop,
+    `--no-follow-symlinks`); `reason` then carries the skip reason the result
+    must report instead of silently shrinking the scan (R1d). Files reached
+    through a symlink carry a `rel` of the form `link -> target` (R1b) so a
+    finding names both.
+    """
+    path: Path | None
+    rel: str
+    reason: str = ""
+
+
+def _dir_key(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def _within_root(target: Path, root: Path) -> bool:
+    """Is `target` inside the scanned `root`? (Both resolved.)"""
+    return target == root or root in target.parents
+
+
+def _dir_visible(parts: tuple[str, ...]) -> bool:
+    """May the walker descend into this directory? Prunes skip-listed
+    subtrees early (rglob walked them anyway; refusing at the branch is the
+    same result for less work) and prunes `.git` to its `hooks/` branch."""
+    for i, seg in enumerate(parts):
+        if seg in SKIP_DIR_PARTS:
+            return False
+        if seg == ".git":
+            rest = parts[i + 1:]
+            return rest == () or (len(rest) >= 1 and rest[0] == HOOKS_DIR)
+    return True
+
+
+def _iter_target_files(root: Path, follow_symlinks: bool = True
+                       ) -> Iterable[_WalkEntry]:
     """Yield every candidate entry under `root`, sorted for a stable order.
 
     Every file is a candidate regardless of suffix — a payload does not care
-    which extension hides it. Directories are filtered here; symlinks
-    (resolvable, broken or looped) are yielded so the caller can classify them.
+    which extension hides it. R1: symlinked directories are descended by
+    default (a skills tree of symlinks — 35 of 37 entries in the reproduced
+    install — is the normal layout, not an attack), and a visited set keyed
+    by (st_dev, st_ino) makes loops and repeat targets terminate as refused
+    entries instead of hangs. `--no-follow-symlinks` refuses every link with
+    a reason. Out-of-root targets are followed; their files are reported as
+    `link -> target` so the finding names both (R1b).
     """
     if root.is_file():
-        yield root
+        yield _WalkEntry(root, root.name)
         return
-    for p in sorted(root.rglob("*")):
-        parts = p.relative_to(root).parts
-        if not _git_visible(parts) or any(seg in SKIP_DIR_PARTS for seg in parts):
-            continue
-        yield p
+    try:
+        visited = {_dir_key(root)}  # a `link -> .` self-loop resolves here
+    except OSError:
+        visited = set()
+
+    def _walk(directory: Path, logical: str,
+              link_pair: tuple[str, str] | None) -> Iterable[_WalkEntry]:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return  # unreadable directory: scan_path's zero-scan refusal reports it
+        for entry in entries:
+            rel = f"{logical}/{entry.name}" if logical else entry.name
+            parts = tuple(rel.split("/"))
+            if any(seg in SKIP_DIR_PARTS for seg in parts):
+                continue
+            path = directory / entry.name
+            if entry.is_symlink():
+                yield from _symlink_entry(path, rel, follow_symlinks, visited)
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                # `_git_visible` would reject `.git` itself and the walk would
+                # never reach `.git/hooks/**` — descent permission is
+                # `_dir_visible`'s job; the file-level check below re-applies
+                # the .git policy to leaves.
+                if _dir_visible(parts):
+                    try:
+                        visited.add(_dir_key(path))
+                    except OSError:
+                        pass
+                    yield from _walk(path, rel, link_pair)
+                continue
+            if entry.is_file(follow_symlinks=False) and _git_visible(parts):
+                if link_pair is None:
+                    yield _WalkEntry(path, rel)
+                else:
+                    # file under a symlinked directory: name link and target
+                    sub = rel[len(link_pair[0]) + 1:]
+                    yield _WalkEntry(path, f"{rel} -> {link_pair[1]}/{sub}")
+
+    def _symlink_entry(path: Path, rel: str, follow: bool,
+                       seen: set[tuple[int, int]]) -> Iterable[_WalkEntry]:
+        try:
+            st = os.stat(path)  # follows the chain; ELOOP on a cycle
+        except OSError as e:
+            # NB: this is a generator, so refusals must be *yielded* — a
+            # `return (entry,)` would only set StopIteration.value and vanish.
+            if e.errno == errno.ELOOP:
+                yield _WalkEntry(None, rel, "symlink loop (ELOOP) — not followed")
+            else:
+                yield _WalkEntry(None, rel,
+                                 "broken symlink (unresolvable target)")
+            return
+        if stat.S_ISDIR(st.st_mode):
+            if not follow:
+                yield _WalkEntry(None, rel,
+                                 "symlink not followed (--no-follow-symlinks)")
+                return
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                yield _WalkEntry(None, rel,
+                                 "symlink loop — target directory already "
+                                 "scanned, skipped")
+                return
+            seen.add(key)
+            target = Path(os.path.realpath(path))
+            # R1b: the 'link -> target' attribution names where content
+            # really lives — only when that is OUTSIDE the scan root. An
+            # in-root link (a convenience alias inside the tree) keeps its
+            # plain relative path, which is already unambiguous.
+            pair = None if _within_root(target, root) else (rel, str(target))
+            yield from _walk(path, rel, pair)
+            return
+        if stat.S_ISREG(st.st_mode):
+            if not follow:
+                yield _WalkEntry(None, rel,
+                                 "symlink not followed (--no-follow-symlinks)")
+                return
+            target = os.path.realpath(path)
+            display = rel if _within_root(Path(target), root) \
+                else f"{rel} -> {target}"
+            yield _WalkEntry(path, display)
+            return
+        return  # fifo/socket/device behind a link: nothing to scan
+
+    yield from _walk(root, "", None)
 
 
 # BOM sniffing order matters: UTF-32-LE's BOM starts with UTF-16-LE's, so the
@@ -319,6 +481,90 @@ def _iter_target_files(root: Path) -> Iterable[Path]:
 _BOMS = ((b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"),
          (b"\xef\xbb\xbf", "utf-8-sig"),
          (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16"))
+
+# C0 control bytes (tab/CR/LF excepted) plus DEL: a dense cluster of these in
+# the first chunk is the fingerprint of binary content. Counted via translate
+# so the sniff stays C-speed — it runs on every file of every walk.
+_CONTROL_BYTES = bytes(b for b in range(0x20) if b not in (0x09, 0x0A, 0x0D)) + b"\x7f"
+
+# V8: the controls plus every byte >= 0x80. Real-world binaries — PNG, gzip —
+# keep their entropy in non-control bytes, so their fingerprint is density in
+# this wider set combined with a failed strict UTF-8 decode. Same translate
+# trick, same C-speed.
+_NONPRINT_BYTES = _CONTROL_BYTES + bytes(range(0x80, 0x100))
+
+
+def _read_head(path: Path) -> bytes:
+    """The first BINARY_PROBE_BYTES of a file — all the binary sniff ever reads."""
+    with path.open("rb") as fh:
+        return fh.read(BINARY_PROBE_BYTES)
+
+
+def _utf16_mostly_printable(head: bytes, bar: float) -> bool:
+    """True if the chunk decodes as BOM-less UTF-16 at >= bar printable.
+
+    The text escape both density branches of _looks_binary share: a chunk
+    that reads as (mostly) printable UTF-16 in either endianness is a text
+    file, not binary soup.
+    """
+    for enc in ("utf-16-le", "utf-16-be"):
+        try:
+            text = head.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+        if printable >= len(text) * bar:
+            return True
+    return False
+
+
+def _looks_binary(head: bytes) -> bool:
+    """Cheap, deterministic binary sniff on a file's first chunk.
+
+    Two densities, one 1/4 threshold. Control density (C0 minus tab/CR/LF
+    plus DEL) at/above the threshold is the classic binary fingerprint,
+    with the decode ladder's text escapes kept: a BOM, or a BOM-less
+    control-dense chunk that still decodes as mostly-printable (>= 0.8)
+    UTF-16, is text. Non-print density (controls + bytes >= 0x80) at the
+    same threshold catches real-world binaries — PNG, gzip — whose entropy
+    lives in non-control bytes, but only when the chunk also fails a strict
+    UTF-8 decode: valid UTF-8 stays text however high its bytes run (unicode
+    smuggling must keep getting scanned), and the UTF-16 escape still holds
+    at a stricter >= 0.95 printable bar — random bytes luck into ~0.85-0.9
+    printable UTF-16 (a gzip head sits at ~0.88), real UTF-16 text is
+    essentially all printable. That branch also knows a NUL rule: a
+    single-byte legacy encoding (cp1251, koi8-r, latin-1) never encodes a
+    real character as NUL, so an undecodable non-print-dense chunk with
+    zero NUL bytes is legacy text and stays scannable — real binaries
+    carry NULs in their first chunk. Below both densities a file stays
+    scannable —
+    a bytecode blob with an embedded ASCII payload stays in the scan
+    (latin-1 keeps its attack strings visible); only control or
+    undecodable non-print soup is skipped.
+    """
+    if not head or any(head.startswith(bom) for bom, _ in _BOMS):
+        return False
+    controls = len(head) - len(head.translate(None, _CONTROL_BYTES))
+    if controls * 4 >= len(head):
+        return not _utf16_mostly_printable(head, 0.8)
+    # V8 (review r1): control-sparse is not proof of text. Entropy hiding in
+    # high bytes plus a failed strict UTF-8 decode is binary; the stricter
+    # 0.95 bar on the UTF-16 escape keeps BOM-less UTF-16 text scannable.
+    nonprint = len(head) - len(head.translate(None, _NONPRINT_BYTES))
+    if nonprint * 4 >= len(head):
+        try:
+            head.decode("utf-8")
+        except UnicodeDecodeError:
+            # V8 (review r2): a single-byte legacy encoding (cp1251, koi8-r,
+            # latin-1) can never encode a real character as NUL, so its
+            # high-byte-dense prose carries zero NULs, while real binaries
+            # all carry NULs in the first chunk. NUL-free soup here is
+            # legacy text — keep it scannable instead of skipping a hostile
+            # file as "binary" and reporting a false clean.
+            if head.count(0) == 0:
+                return False
+            return not _utf16_mostly_printable(head, 0.95)
+    return False
 
 
 def _decode_scannable(raw: bytes) -> tuple[str, bool]:
@@ -396,39 +642,62 @@ def _read_scannable(path: Path) -> tuple[str, bool, bool]:
 def scan_file(path: Path, rules: list[Rule], root: Path,
               honor_ignores: bool = False, *,
               deadline: float | None = None,
-              timeout: float | None = None
+              timeout: float | None = None,
+              rel: str | None = None,
               ) -> tuple[list[Finding], int, str, bool, list[Finding], bool]:
     """Scan one file. Returns (candidates, suppressed, text, truncated, final,
     decodable).
 
     Candidates are unverified: `scan_path` runs them through the verifier
     before they become findings. Correlation rules (`requires_pattern`) are
-    resolved here, because only this function has the whole file text.
+    resolved in `_scan_text`, because only it has the whole file text.
     `final` carries evidence-backed findings (invisible-unicode marker,
     stage-2 decoded payloads) that skip grading because the evidence is the
     decode itself, not a judgement about the line.
 
+    `rel` overrides the reported path (R1b `link -> target` display); the
+    default is the path relative to `root`.
+
     `deadline` (from `--timeout SEC`) is checked between rules and inside
     match storms, so a single pathological file cannot outlive the budget —
     expiry raises the same InputError `scan_path` raises between files.
+    """
+    try:
+        text, truncated, decodable = _read_scannable(path)
+    except OSError as e:
+        # unreadable (mode 000), vanished mid-scan: an input problem, not a bug.
+        # Raised as UnreadableFileError so `scan_path` can record the file and
+        # keep walking instead of discarding the readable files' findings (V5).
+        raise UnreadableFileError(f"cannot read {path}: {e.strerror or e}") from None
+    if rel is None:
+        rel = str(path.relative_to(root)) if path != root else path.name
+    candidates, suppressed, final = _scan_text(
+        text, rel, rules, honor_ignores, deadline=deadline, timeout=timeout)
+    return candidates, suppressed, text, truncated, final, decodable
+
+
+def _scan_text(text: str, rel: str, rules: list[Rule], honor_ignores: bool, *,
+               deadline: float | None = None,
+               timeout: float | None = None,
+               ) -> tuple[list[Finding], int, list[Finding]]:
+    """Match `rules` against in-memory text, reported as `rel`.
+
+    Returns (candidates, suppressed, final). The matcher half of `scan_file`,
+    split out so archive members (R3) — which never become files on disk —
+    run through the identical rule passes: raw, invisible-normalized, and
+    stage-2 decoded payloads.
     """
 
     def _check_deadline() -> None:
         if deadline is not None and time.monotonic() > deadline:
             raise InputError(f"timed out after {timeout:g} s")
 
-    try:
-        text, truncated, decodable = _read_scannable(path)
-    except OSError as e:
-        # unreadable (mode 000), vanished mid-scan: an input problem, not a bug
-        raise InputError(f"cannot read {path}: {e.strerror or e}") from None
     candidates: list[Finding] = []
     final: list[Finding] = []
     suppressed = 0
-    rel = str(path.relative_to(root)) if path != root else path.name
     lines = text.splitlines()
     if honor_ignores and NOQA_FILE in "\n".join(lines[:10]):
-        return [], len(lines), text, truncated, [], decodable  # wholesale suppression, counted as suppressed
+        return [], len(lines), []  # wholesale suppression, counted as suppressed
     rule_by_id = {r.id: r for r in rules}
     for rule in rules:
         _check_deadline()
@@ -521,7 +790,7 @@ def scan_file(path: Path, rules: list[Rule], root: Path,
                        f"{assign_line}): {m.group(0)[:60]!r} in the decoded text",
                 decoded_from=f"{var}@{assign_line}",
             ))
-    return candidates, suppressed, text, truncated, final, decodable
+    return candidates, suppressed, final
 
 
 def _verification_alias(rel: str) -> str:
@@ -541,13 +810,285 @@ def _verification_alias(rel: str) -> str:
     return rel
 
 
+def _archive_kind(name: str) -> str | None:
+    """'zip', 'tar', or None. Only containers shipped as skills (R3) count:
+    a plain `.gz` blob is not an archive and stays on the binary-skip path."""
+    low = name.lower()
+    if low.endswith(ARCHIVE_SUFFIXES_TAR):
+        return "tar"
+    if low.endswith(ARCHIVE_SUFFIXES_ZIP):
+        return "zip"
+    return None
+
+
+def _member_escapes(name: str) -> bool:
+    """Does this member name try to leave the archive? Absolute paths,
+    drive letters, and any `..` that climbs above the root (zip-slip)."""
+    pure = PurePosixPath(name)
+    if pure.is_absolute():
+        return True
+    if pure.parts and ":" in pure.parts[0]:  # windows drive/URI prefix
+        return True
+    depth = 0
+    for part in pure.parts:
+        if part == "..":
+            depth -= 1
+            if depth < 0:
+                return True
+        elif part not in (".", ""):
+            depth += 1
+    return False
+
+
+def _read_archive_members(path: Path, rel: str, kind: str, *,
+                          max_bytes: int) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Read an archive's members into memory. Returns (members, warnings).
+
+    Members are `(name, data)` pairs — nothing is ever written to disk, so a
+    traversal name has nowhere to escape to (R3c) and the read itself bounds
+    a bomb (R3b). Every refusal appends a warning the result must carry:
+    - entry count over ARCHIVE_MAX_ENTRIES → the whole archive is refused;
+    - member over max_bytes, or compressed:uncompressed ratio over
+      ARCHIVE_BOMB_RATIO → that member is refused (zip only, where the
+      header states both sizes);
+    - `_member_escapes(name)` → that member is refused.
+    A corrupt container is a warning plus an empty member list, not a crash.
+    """
+    members: list[tuple[str, bytes]] = []
+    warnings: list[str] = []
+
+    def _skip(name: str, why: str) -> None:
+        warnings.append(f"warning: skipped archive member {rel}!{name}: {why}")
+
+    try:
+        if kind == "zip":
+            with zipfile.ZipFile(path) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()]
+                if len(infos) > ARCHIVE_MAX_ENTRIES:
+                    warnings.append(
+                        f"warning: skipped archive {rel}: {len(infos)} members "
+                        f"exceed the {ARCHIVE_MAX_ENTRIES}-entry bound")
+                    return members, warnings
+                for info in infos:
+                    name = info.filename
+                    if _member_escapes(name):
+                        _skip(name, "member path escapes the archive (traversal)")
+                        continue
+                    if info.file_size > max_bytes:
+                        _skip(name, f"{info.file_size} uncompressed bytes exceed "
+                                    f"--archive-max-bytes={max_bytes}")
+                        continue
+                    if info.compress_size > 0 and (
+                            info.file_size / info.compress_size > ARCHIVE_BOMB_RATIO):
+                        _skip(name, f"compression ratio over {ARCHIVE_BOMB_RATIO}:1 "
+                                    "(zip-bomb guard)")
+                        continue
+                    with zf.open(info) as fh:
+                        members.append((name, fh.read(max_bytes + 1)))
+        else:
+            with tarfile.open(path, "r:*") as tf:
+                infos = [m for m in tf.getmembers() if m.isfile()]
+                if len(infos) > ARCHIVE_MAX_ENTRIES:
+                    warnings.append(
+                        f"warning: skipped archive {rel}: {len(infos)} members "
+                        f"exceed the {ARCHIVE_MAX_ENTRIES}-entry bound")
+                    return members, warnings
+                for m in infos:
+                    if _member_escapes(m.name):
+                        _skip(m.name, "member path escapes the archive (traversal)")
+                        continue
+                    if m.size > max_bytes:
+                        _skip(m.name, f"{m.size} uncompressed bytes exceed "
+                                      f"--archive-max-bytes={max_bytes}")
+                        continue
+                    fh = tf.extractfile(m)
+                    if fh is None:
+                        continue
+                    members.append((m.name, fh.read(max_bytes + 1)))
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError,
+            zlib.error, MemoryError) as e:
+        # A truncated or corrupt container is untrusted input, not a bug:
+        # warn, keep whatever complete members were read, and move on.
+        warnings.append(f"warning: skipped unreadable archive {rel}: {e}")
+        return members, warnings
+    return members, warnings
+
+
+# --- Doc-context demotion (card t_3501ae36) -----------------------------------
+# A payload that sits in a documentation context is a quoted specimen, not the
+# artifact acting — for every rule class except injection prose and
+# download-and-exec (see NEVER_DEMOTE_CATEGORIES in rules.py). The contexts are
+# detected here, after the verifier has graded, so the pass and the verifier
+# share one notion of fence/span/file-context (the verifier's own helpers).
+
+JSONL_SUFFIXES = (".jsonl", ".ndjson")
+_HEADING = re.compile(r"^#{1,6}\s")
+# The span-inside-match tell (card t_3501ae36, phase 3): weaker than the six
+# structural contexts, so it only settles a hit the verifier CONFIRMED — a
+# candidate already demoted with its own written reason (a rule-specific
+# precision screen, a cancel word) keeps that reason.
+_SPAN_IN_MATCH = "line quoting an inline code span inside the match"
+
+
+def _nearest_heading(lines: list[str], line_no: int) -> str:
+    """Text of the closest ATX heading at or above `line_no` (1-based), or ''."""
+    for i in range(line_no - 1, -1, -1):
+        if _HEADING.match(lines[i]):
+            return lines[i]
+    return ""
+
+
+def _fence_is_framed(lines: list[str], fenced: list[bool], line_no: int) -> bool:
+    """Is the fenced block explicitly presented as documentation? Frame
+    evidence: an example/install/usage word in an in-fence `#` comment above
+    the payload, on the intro line above the fence, or in the nearest heading
+    — never on the payload line itself (the attacker controls it). The live
+    corpus documents `curl … | bash` installers exactly this way
+    (Installation/Quick Start headings, `# Install …` comments); those are
+    specimens, not payloads."""
+    evidence: list[str] = []
+    open_idx = 0
+    for i in range(line_no - 1, -1, -1):
+        if not fenced[i]:
+            open_idx = i  # the fence marker line carries state False
+            break
+        if lines[i].lstrip().startswith("#"):  # shell comment inside the fence
+            evidence.append(lines[i])
+    for i in range(open_idx - 1, -1, -1):  # nearest non-blank line above the fence
+        if lines[i].strip():
+            evidence.append(lines[i])
+            break
+    evidence.append(_nearest_heading(lines, line_no))
+    return any(DOC_FRAME.search(e) for e in evidence)
+
+
+def _span_inside_match(line: str, raw: str) -> bool:
+    """The match itself quotes a code span: a non-empty `...` token sits
+    fully INSIDE the matched text. `- **Major rewrite:** `write_file` the
+    whole SKILL.md.` — the matched directive names its own verb as quoted
+    code, which a real directive never does (it just says it)."""
+    if not raw:
+        return False
+    j = raw.find("`")
+    while j >= 0:
+        k = raw.find("`", j + 1)
+        if k <= j + 1:  # empty or missing span
+            if k < 0:
+                return False
+        else:
+            return True
+        j = raw.find("`", k + 1)
+    return False
+
+
+def _doc_context(lines: list[str], rel: str, line_no: int, raw: str,
+                 ctx: str, fenced_line: bool) -> str:
+    """The documentation context owning this match, as a short human phrase
+    used verbatim in the demotion reason ('' when none applies). A JSONL log
+    record is a log in any file context; the markdown contexts apply only to
+    directive/documentation files — in a code file a pipe or `>` is syntax,
+    not markup."""
+    line = lines[line_no - 1]
+    if Path(rel).name.lower().endswith(JSONL_SUFFIXES):
+        try:
+            if isinstance(json.loads(line), dict):
+                return "JSONL log line quoting an earlier command"
+        except ValueError:
+            pass  # prose smuggled into a .jsonl name is not a log record
+    if ctx not in ("documentation", "directive"):
+        return ""
+    if fenced_line:
+        return "fenced code block"
+    if _in_code_span(line, raw):
+        return "inline code span"
+    if _span_inside_match(line, raw):
+        return _SPAN_IN_MATCH
+    if line.lstrip().startswith(">"):
+        return "blockquote line"
+    if line.lstrip().startswith("|"):
+        return "markdown table row"
+    if DOC_SECTION_HEADING.search(_nearest_heading(lines, line_no)):
+        return "example/usage section"
+    return ""
+
+
+def _apply_doc_context_demotion(candidates: list[Finding], sources: dict[str, str],
+                                rules_by_id: dict[str, Rule], roots: frozenset[str],
+                                cfg) -> None:
+    """Settle doc contexts the verifier cannot see (blockquote, table row,
+    example section, JSONL record), and re-decide the fence for the classes
+    that never take the specimen reading from context alone. Mutates each
+    candidate's verdict/reason in place; skipped entirely by `strict`
+    (disable_demotions declines every judgement, doc contexts included)."""
+    if cfg.disable_demotions:
+        return
+    fenced_by_file: dict[str, list[bool]] = {}
+    ordinal: dict[tuple[str, int, str], int] = {}
+    for f in candidates:
+        rule = rules_by_id.get(f.rule_id)
+        text = sources.get(f.file)
+        if rule is None or rule.pattern is None or text is None:
+            continue
+        lines = text.splitlines()
+        if not 0 < f.line <= len(lines):
+            continue
+        ctx = _ctx_of(f.file, roots)
+        fenced = None
+        if ctx in ("documentation", "directive"):
+            fenced = fenced_by_file.get(f.file)
+            if fenced is None:
+                fenced = fenced_by_file[f.file] = _fenced_state(lines)
+        # The n-th match on the line, exactly as verify_findings graded it.
+        key = (f.file, f.line, f.rule_id)
+        n = ordinal.get(key, 0)
+        ordinal[key] = n + 1
+        m = next(islice(rule.pattern.finditer(lines[f.line - 1]), n, None), None)
+        raw = m.group(0) if m else f.snippet
+        fenced_line = bool(fenced is not None and fenced[f.line - 1])
+        phrase = _doc_context(lines, f.file, f.line, raw, ctx, fenced_line)
+        if not phrase:
+            continue
+        if rule.category not in NEVER_DEMOTE_CATEGORIES:
+            if phrase == _SPAN_IN_MATCH and f.verdict != "exploitable":
+                continue  # the verifier already wrote a specific reason for this hit
+            if has_exfil_combo(lines, f.line):
+                # Fail-closed combo (card t_3501ae36, rework): secret access +
+                # egress/subprocess within +-5 lines is exfiltration staging —
+                # a fence/span/quote/table/example section/JSONL record never
+                # demotes it, in any file context.
+                f.verdict = "exploitable"
+                f.reason = ("secret access and network egress in the same "
+                            "+/-5-line window — fail-closed combo, a doc "
+                            "context never demotes it")
+                continue
+            f.verdict = "low_trust"
+            f.reason = (f"match sits in a {phrase} — quoted documentation "
+                        "(a specimen the agent reads about), not the artifact acting")
+            continue
+        # Injection prose and download-and-exec: context alone grants nothing.
+        # An unframed fenced block is attacker-controlled framing — the hit
+        # stays a finding; a framed one keeps the verifier's specimen verdict.
+        if not fenced_line:
+            continue  # spans/tables/quotes keep the verifier's own reading
+        if rule.category == "rce-download" and not SHELL_PIPE.search(raw):
+            continue  # `curl … | python -c` parses output; it does not exec it
+        if _fence_is_framed(lines, fenced, f.line):
+            continue
+        f.verdict = "exploitable"
+        f.reason = ("payload in a fenced block with no documentation frame "
+                    "(no example/install/usage wording) — the fence is "
+                    "attacker-controlled framing, not a specimen; stays a finding")
+
+
 def scan_path(target: str | Path, rules_path: str | None = None, *,
               honor_ignores: bool = False,
               exclude: list[str] | None = None,
               ignore_patterns: list[str] | None = None,
               profile: str = "balanced",
               timeout: float | None = None,
-              max_files: int | None = None) -> ScanResult:
+              max_files: int | None = None,
+              follow_symlinks: bool = True,
+              archive_max_bytes: int = DEFAULT_ARCHIVE_MAX_BYTES) -> ScanResult:
     """Scan a path. Pattern matches are candidates; the verifier grades them.
 
     Only `exploitable` findings are reported as findings — everything else is kept in
@@ -595,26 +1136,34 @@ def scan_path(target: str | Path, rules_path: str | None = None, *,
     deadline = time.monotonic() + timeout if timeout else None
     linked: set[tuple[int, int]] = set()  # (st_dev, st_ino) of resolved symlink targets
     over_limit = 0
-    for p in _iter_target_files(root):
-        rel = str(p.relative_to(root)) if p != root else p.name
+    for entry in _iter_target_files(root, follow_symlinks):
+        rel, p = entry.rel, entry.path
+        if p is None:
+            # R1c/R1d: a link the policy declined (loop, broken, or
+            # --no-follow-symlinks). A skip the output does not explain is
+            # indistinguishable from a clean scan, so it lands in
+            # files_skipped WITH its reason.
+            result.files_skipped += 1
+            result.warnings.append(f"warning: skipped {rel}: {entry.reason}")
+            continue
         if p.is_symlink():
-            # Resolve the link: broken links and loops surface as skipped
-            # files, never as hangs; a target inode seen before is a cycle or
-            # a second link to an already-scanned file.
+            # A file link resolves here: a target inode seen before is a
+            # cycle or a second link to an already-scanned file.
             try:
                 st = os.stat(p)  # follows the chain; ELOOP on a cycle
             except OSError:
                 result.files_skipped += 1
+                result.warnings.append(f"warning: skipped {rel}: unresolvable symlink")
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
             target = (st.st_dev, st.st_ino)
             if target in linked:
                 result.files_skipped += 1
+                result.warnings.append(
+                    f"warning: skipped {rel}: symlink target already scanned")
                 continue
             linked.add(target)
-        elif not p.is_file():
-            continue  # directories and other non-regular entries
         if excludes and _is_excluded(rel, excludes):
             result.files_skipped += 1
             continue
@@ -627,9 +1176,54 @@ def scan_path(target: str | Path, rules_path: str | None = None, *,
             continue
         if deadline is not None and time.monotonic() > deadline:
             raise InputError(f"timed out after {timeout:g} s")
-        found, suppressed, text, truncated, file_final, decodable = scan_file(
-            p, rules, root, honor_ignores=honor_ignores,
-            deadline=deadline, timeout=timeout)
+        kind = _archive_kind(p.name)
+        if kind is not None:
+            # R3: the container is opened and its text members matched in
+            # memory — never extracted — with findings attributed
+            # '<archive>!<inner/path>'. Every guard refusal is a warning
+            # counted in files_skipped, not a silent hole.
+            member_reports, archive_warnings = _read_archive_members(
+                p, rel, kind, max_bytes=archive_max_bytes)
+            result.warnings.extend(archive_warnings)
+            result.files_skipped += len(archive_warnings)
+            for name, data in member_reports:
+                if max_files is not None and result.files_scanned >= max_files:
+                    over_limit += 1
+                    break
+                mrel = f"{rel}!{name}"
+                if _looks_binary(data[:8192]):
+                    result.binary_files_skipped += 1
+                    continue
+                text, decodable = _decode_scannable(data)
+                found, suppressed_members, member_final = _scan_text(
+                    text, mrel, rules, honor_ignores,
+                    deadline=deadline, timeout=timeout)
+                result.files_scanned += 1
+                scanned_rels.append(mrel)
+                result.suppressed += suppressed_members
+                if not decodable:
+                    result.undecodable_files.append(mrel)
+                if found:
+                    candidates.extend(found)
+                    sources[found[0].file] = text
+                final.extend(member_final)
+            continue
+        try:
+            if _looks_binary(_read_head(p)):
+                # V8: a NUL-dense non-text file is reported separately instead
+                # of silently counting as a scanned file
+                result.binary_files_skipped += 1
+                continue
+            found, suppressed, text, truncated, file_final, decodable = scan_file(
+                p, rules, root, honor_ignores=honor_ignores,
+                deadline=deadline, timeout=timeout, rel=rel)
+        except (UnreadableFileError, OSError):
+            # V5: one unreadable file must not discard the findings already
+            # collected from the readable rest — record it, keep walking; the
+            # CLI warns and exits 2. (Timeouts raise plain InputError and
+            # still propagate.)
+            result.unreadable_files.append(rel)
+            continue
         result.files_scanned += 1
         scanned_rels.append(rel)
         result.suppressed += suppressed
@@ -660,11 +1254,12 @@ def scan_path(target: str | Path, rules_path: str | None = None, *,
             f".skillsentinelignore excludes skill manifest {ignored_manifest!r} — "
             "refusing to scan a skill without its manifest")
     if result.files_scanned == 0 and not result.limit_reached:
-        # Every file was excluded/ignored/skipped: the walk saw nothing, so a
-        # clean verdict here would prove nothing (same refusal as a whole-skill
-        # .skillsentinelignore). limit_reached keeps its own exit-2 report.
+        # Every file was excluded/ignored/skipped/unreadable/binary: the walk
+        # saw nothing scannable, so a clean verdict here would prove nothing
+        # (same refusal as a whole-skill .skillsentinelignore). limit_reached
+        # keeps its own exit-2 report.
         raise InputError(
-            f"scanned 0 files in {root} (all excluded or skipped) — "
+            f"scanned 0 files in {root} (all excluded, unreadable or skipped) — "
             "refusing to report an empty scan as clean")
     if (deadline is not None and time.monotonic() > deadline) or (
             len(result.undecodable_files) == result.files_scanned):
@@ -698,12 +1293,18 @@ def scan_path(target: str | Path, rules_path: str | None = None, *,
     by_key: dict[tuple[str, int, str], tuple[str, str]] = {}
     for v in verdicts:
         by_key.setdefault((v.file, v.line, v.rule_id), (v.verdict, v.reason))
-    result.verdicts = {}
-    for v in verdicts:
-        result.verdicts[v.verdict] = result.verdicts.get(v.verdict, 0) + 1
     for f in candidates:
         f.verdict, f.reason = by_key.get((f.file, f.line, f.rule_id),
                                          ("inconclusive", "not graded"))
+    # Doc-context demotion (t_3501ae36): quoted specimens in documentation are
+    # not the artifact acting — except injection prose and shell pipes, which
+    # an unframed fence does not excuse. Runs after grading so the histogram
+    # and the findings/demoted split below reflect the final verdicts.
+    _apply_doc_context_demotion(candidates, sources, {r.id: r for r in rules},
+                                _directive_roots(scanned_rels), cfg)
+    result.verdicts = {}
+    for f in candidates:
+        result.verdicts[f.verdict] = result.verdicts.get(f.verdict, 0) + 1
         if f.verdict == "exploitable":
             result.findings.append(f)
         else:
@@ -734,7 +1335,9 @@ def scan_path(target: str | Path, rules_path: str | None = None, *,
 def to_sarif(result: ScanResult, rules: list[Rule] | None = None) -> dict:
     rules = rules or load_rules()
     return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/json/gitHubAndroidWorkflow-2.1.0-rtm.5.json",
+        # canonical SARIF 2.1.0 schema (the oasis-tcs GitHub URL this used to
+        # carry was a dead Android-workflow schema, 404 since 2019)
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
             "tool": {"driver": {

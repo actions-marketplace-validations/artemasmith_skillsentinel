@@ -11,9 +11,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__
+from .baseline import classify as classify_baseline, finding_key, write_baseline
 from .detonate import DetonationRefusedError, detonate_tree
 from .rules import load_rules, SEVERITY_ORDER
-from .scanner import InputError, scan_path, to_sarif
+from .scanner import (DEFAULT_ARCHIVE_MAX_BYTES, InputError, scan_path, to_sarif)
 from .verifier import VERIFIERS_BY_NAME
 from .watch import (write_snapshot, load_snapshot, diff_snapshots, snapshot_dir,
                     rescan_changes)
@@ -86,13 +87,15 @@ def _emit_stdout(emit: Callable[[], None], what: str) -> bool:
 
 
 def _print_findings(result, use_color: bool, suppressed: int = 0,
-                    show_inconclusive: bool = False) -> None:
+                    show_inconclusive: bool = False,
+                    baselined: set | None = None) -> None:
     c = result.counts
     total = sum(c.values())
     dropped = len(result.demoted)
     inconclusive = [f for f in result.demoted if f.verdict == "inconclusive"]
     print(f"SkillSentinel v{__version__} — scanned {result.path} "
-          f"({result.files_scanned} files, {result.files_skipped} skipped, "
+          f"({result.files_scanned} text, {result.binary_files_skipped} binary "
+          f"skipped, {result.files_skipped} skipped, "
           f"profile: {result.profile})")
     if result.undecodable_files:
         # D3: undecodable files are reported loudly, never silently dropped.
@@ -119,7 +122,8 @@ def _print_findings(result, use_color: bool, suppressed: int = 0,
                 print(_colorized(f"\n== {cur.upper()} ==", cur, use_color))
             print(_colorized(f"[{f.rule_id}] {f.file}:{f.line}", cur, use_color)
                   + (f"  (x{f.count})" if f.count > 1 else "")
-                  + f"  {f.title}")
+                  + f"  {f.title}"
+                  + ("  (baselined)" if baselined and finding_key(f) in baselined else ""))
             print(f"    {f.snippet[:160]}")
             print(f"    verdict: {f.verdict} — {f.reason}")
     if show_inconclusive or inconclusive:
@@ -142,16 +146,35 @@ def load_ignore_file(root: Path) -> list[str]:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     root = Path(args.path).expanduser()
+    if args.baseline and args.write_baseline:
+        raise InputError("--baseline and --write-baseline are mutually "
+                         "exclusive: one run either checks against a baseline "
+                         "or writes one")
     # `.skillsentinelignore` is input from the scanned tree, so it is trusted
     # only under --honor-ignores — exactly like inline suppression markers.
     ignore_patterns = load_ignore_file(root) if args.honor_ignores else []
     result = scan_path(args.path, args.rules,
-                      honor_ignores=args.honor_ignores,
+                       honor_ignores=args.honor_ignores,
                        exclude=list(args.exclude),
                        ignore_patterns=ignore_patterns,
                        profile=args.profile,
                        timeout=args.timeout,
-                       max_files=args.max_files)
+                       max_files=args.max_files,
+                       follow_symlinks=not args.no_follow_symlinks,
+                       archive_max_bytes=args.archive_max_bytes)
+    # Baseline classification happens before reporting: the report must still
+    # show every finding (a baseline never hides anything from the report), so
+    # classification only computes which findings count for the exit code.
+    baseline_new: list = []
+    baseline_hit: list = []
+    baselined_keys: set | None = None
+    if args.baseline:
+        try:
+            baseline_new, baseline_hit = classify_baseline(result, args.baseline)
+        except ValueError as e:
+            raise InputError(str(e)) from None
+        baselined_keys = {finding_key(f) for f in baseline_hit}
+
     reports = None
     if args.detonate:
         try:
@@ -163,7 +186,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     def _text_report() -> None:
         _print_findings(result, use_color=sys.stdout is not None and sys.stdout.isatty(),
                         suppressed=result.suppressed,
-                        show_inconclusive=args.show_inconclusive)
+                        show_inconclusive=args.show_inconclusive,
+                        baselined=baselined_keys)
         if reports is not None:
             print(f"\n-- Detonation ({len(reports)} scripts) --")
             for r in reports:
@@ -201,11 +225,47 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 lambda: print(f"\nSARIF written to {args.sarif}"),
                 "the SARIF confirmation to stdout"):
             return 2
+    # R1c/R1d/R3b: refusals the scan accounted for (loops, unfollowed or
+    # broken links, guarded archives) are part of the verdict's evidence —
+    # they go to stderr in both output modes, never silently dropped.
+    for w in result.warnings:
+        print(w, file=sys.stderr)
     if result.limit_reached is not None:
         n, m = result.limit_reached
         print(f"error: limit reached: {n} of {m} files scanned "
               f"(raise --max-files to see the rest)", file=sys.stderr)
         return 2
+    if result.unreadable_files:
+        # V5: the readable files' findings are printed above; an unreadable
+        # file is still an input problem, so the run warns and exits 2.
+        # Input problems outrank the baseline exit contract: a baseline run
+        # over a tree we could not fully read must not report a clean 0.
+        names = ", ".join(result.unreadable_files[:3])
+        more = f" (+{len(result.unreadable_files) - 3} more)" \
+            if len(result.unreadable_files) > 3 else ""
+        print(f"warning: {len(result.unreadable_files)} file(s) could not be "
+              f"read: {names}{more}", file=sys.stderr)
+        return 2
+    if args.write_baseline:
+        try:
+            n_recorded = write_baseline(result, args.write_baseline)
+        except OSError as e:
+            print(f"skillsentinel: error: cannot write the baseline to "
+                  f"{args.write_baseline}: {e}", file=sys.stderr)
+            return 2
+        # Keep stdout machine-readable under --json: the confirmation goes to
+        # stderr. Writing a baseline records findings; it does not bless them,
+        # so the normal exit-code contract is unchanged.
+        print(f"baseline: wrote {n_recorded} finding(s) to {args.write_baseline}",
+              file=sys.stderr)
+    if args.baseline:
+        n_new, n_hit = len(baseline_new), len(baseline_hit)
+        line = f"baseline: {n_new} new, {n_hit} baselined"
+        # Under --json stdout stays pure JSON, so the summary rides on stderr.
+        print(line, file=sys.stderr if args.json else sys.stdout)
+        threshold = SEVERITY_ORDER[args.severity]
+        return 1 if any(SEVERITY_ORDER[f.severity] >= threshold
+                        for f in baseline_new) else 0
     threshold = SEVERITY_ORDER[args.severity]
     return 1 if result.max_severity_rank() >= threshold else 0
 
@@ -227,6 +287,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
             old = load_snapshot(snap_path)
         except (OSError, ValueError) as e:
             raise InputError(f"cannot read snapshot {snap_path}: {e}") from None
+        snap_root = old.get("root")
+        if snap_root and Path(snap_root) != root:
+            # V2: diffing another tree used to silently compare apples to
+            # oranges — a fresh install dir reads as "clean" against any
+            # snapshot. The snapshot pins the root it was taken under.
+            raise InputError(
+                f"snapshot root mismatch: the snapshot was taken under "
+                f"{snap_root}, not {root} — re-run watch init")
         new = snapshot_dir(root)
         d = diff_snapshots(old, new)
         if d["clean"]:
@@ -304,8 +372,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-files", type=int, default=None, metavar="N",
                    help="scan at most N files, then exit 2 with a limit report; "
                         "bounds huge trees without silently ignoring the rest")
+    s.add_argument("--no-follow-symlinks", action="store_true",
+                   help="do not descend into or scan symlinked files/directories; "
+                        "every declined link is counted in files_skipped with a "
+                        "warning naming it (symlinked skill dirs ARE followed by "
+                        "default — that is how skills are installed)")
+    s.add_argument("--archive-max-bytes", type=int,
+                   default=DEFAULT_ARCHIVE_MAX_BYTES, metavar="N",
+                   help="per-member uncompressed byte budget for archives scanned "
+                        "in memory (zip/tar.gz/tgz/whl); members over N are skipped "
+                        f"with a warning (default: {DEFAULT_ARCHIVE_MAX_BYTES})")
     s.add_argument("--detonate", action="store_true",
-                   help="run discovered scripts in a disposable bwrap sandbox "
+                   help="run discovered scripts (.sh/.bash/.py/.js/.rb/.pl/.ps1 "
+                        "and files named `install`) in a disposable bwrap sandbox "
                         "with no network access (--unshare-net; requires "
                         "bubblewrap, skipped with a notice otherwise)")
     s.add_argument("--allow-net", action="store_true",
@@ -319,6 +398,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--show-inconclusive", action="store_true",
                    help="also list candidates the verifier graded inconclusive "
                         "(unknown context) with their file:line and reason")
+    s.add_argument("--write-baseline", metavar="FILE",
+                   help="record the current confirmed findings into FILE as "
+                        "accepted (path + rule id + snippet hash + rules_"
+                        "version); the report and exit code are unchanged")
+    s.add_argument("--baseline", metavar="FILE",
+                   help="treat findings recorded in FILE as accepted: they stay "
+                        "in the report but no longer drive the exit code — exit "
+                        "0 when only baselined findings remain, exit 1 on the "
+                        "first new finding (matching is by content, not line "
+                        "number)")
     s.set_defaults(func=cmd_scan)
 
     w = sub.add_parser("watch", help="snapshot installed skills and detect drift")
